@@ -24,7 +24,7 @@ module Parsers
                   './/a[starts-with(@href, "/rent-cottage-for-long/object/")]'
                 end
 
-        link_node = card.at_xpath(xpath)
+        link_node = card.at_xpath(xpath) || card.at_xpath('.//a[starts-with(@href, "/rent-flat-for-long/object/")]')
         next unless link_node
 
         href = link_node['href']

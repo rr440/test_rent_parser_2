@@ -23,7 +23,7 @@ module Parsers
         next unless href
 
         # 2. Извлекаем external_id из URL (число после /dom/)
-        external_id = href.match(%r{/dom/(\d+)})&.captures&.first
+        external_id = href.match(%r{/dom/(\d+)})&.captures&.first || href.match(%r{/kvartiru/(\d+)})&.captures&.first
         next unless external_id
 
         # 3. Цена (удаляем все не-цифры, приводим к целому)
