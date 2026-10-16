@@ -1,5 +1,8 @@
+require 'uri'
+
 module Parsers
   class KufarParser
+    CARD_XPATH = '//*[@data-testid="listing"]//section/a[starts-with(@data-testid, "kufar-realty-card-")]'.freeze
 
     def self.parse(url, for_sell: false)
       new.parse(url, for_sell)
@@ -9,52 +12,95 @@ module Parsers
       @for_sell = for_sell
 
       doc = fetch_page(url)
+      ad_elements = doc.xpath(CARD_XPATH)
 
-      xpath_for_elements = '//div[starts-with(@class, "styles_cards__")]//section'
+      Rails.logger.info("Kufar: найдено карточек: #{ad_elements.size}")
 
-      # 1. Находим все ссылки-карточки (они же являются контейнерами для данных)
-      ad_elements = doc.xpath(xpath_for_elements)
+      if ad_elements.empty?
+        raise "Kufar: карточки не найдены — проверь полученный HTML"
+      end
 
       ad_elements.each do |ad_link|
-        ad_link = ad_link.at_xpath('.//a')
+        # ad_link уже является ссылкой <a>.
         href = ad_link['href']
-        href_cleaned = href&.split('?').first
+        next if href.blank?
 
-        next unless href
+        # Абсолютная ссылка без query-параметров и fragment.
+        ad_uri = URI.join(url, href)
+        ad_uri.query = nil
+        ad_uri.fragment = nil
 
-        # 2. Извлекаем external_id из URL (число после /dom/)
-        external_id = href.match(%r{/dom/(\d+)})&.captures&.first || href.match(%r{/kvartiru/(\d+)})&.captures&.first
+        href_cleaned = ad_uri.to_s
+
+        # Например:
+        # /vi/minsk/snyat/kvartiru/1089624045 → 1089624045
+        external_id = ad_uri.path[%r{/(\d+)/?\z}, 1]
         next unless external_id
 
-        # 3. Цена (удаляем все не-цифры, приводим к целому)
-        price_node = ad_link.at_xpath('./div[2]/div[1]/div[1]/span')
-        price = price_node&.text&.strip&.gsub(/[^\d]/, '')&.to_i
+        # Цена: "2 046 р./мес." → 2046.
+        price_node = ad_link.at_xpath(
+          './/*[@data-testid="card-price"]'
+        )
 
-        # 4. Адрес
-        address_node = ad_link.at_xpath('./div[2]/div[1]/div[2]/div[2]/span')
-        address = address_node&.text&.strip
+        price_text = normalized_text(price_node)
+        price_digits = price_text&.gsub(/[^\d]/, '')
+        price = price_digits.present? ? price_digits.to_i : nil
 
-        # 5. Описание (текст объявления)
-        description_node = ad_link.at_xpath('./div[2]/p')
-        description = description_node&.text&.strip
+        # Не сохраняем карточку с отсутствующей или некорректной ценой.
+        # Иначе можно ошибочно отправить уведомление об изменении цены.
+        unless price&.positive?
+          Rails.logger.warn(
+            "Kufar: пропускаем объявление #{external_id}: " \
+              "не удалось получить цену, текст=#{price_text.inspect}"
+          )
+          next
+        end
 
-        # 6. Фотографии – собираем все <img> внутри блока с фотографиями
-        #    (используем относительный поиск: ищем все img внутри первого div)
-        photo_nodes = ad_link.xpath('./div[1]//img')
-        photos = photo_nodes.map { |img| img['src'] }.compact
+        # В HTML сайта атрибут называется именно card-adress,
+        # с одной буквой d — это не опечатка в парсере.
+        address_node = ad_link.at_xpath(
+          './/*[@data-testid="card-adress"]'
+        )
+        address = normalized_text(address_node)
 
-        # 7. Заголовок – можно взять из описания или сгенерировать
+        # Описание находится в <p> внутри контентного блока.
+        # Используем смысловую часть класса без привязки к хешу.
+        content_node = ad_link.at_xpath(
+          './div[contains(@class, "__content")]'
+        )
+
+        description_node = content_node&.at_xpath('./p')
+        description = normalized_text(description_node)
+
+        # Берём только фотографии из слайдера:
+        # иконка калькулятора и прочие изображения сюда не попадут.
+        photo_nodes = ad_link.xpath(
+          './/div[contains(concat(" ", normalize-space(@class), " "), " swiper-slide ")]//img'
+        )
+
+        photos = photo_nodes.filter_map do |img|
+          src = img['data-src'].presence || img['src'].presence
+          next if src.blank? || src.start_with?('data:')
+
+          URI.join(href_cleaned, src).to_s
+        end.uniq
+
         title = "Объявление #{external_id}"
 
         ad_attrs = {
           external_id: external_id,
           site: @for_sell.present? ? 'kufar_for_sell' : 'kufar',
-          url: href_cleaned || href,
+          url: href_cleaned,
           title: title,
           price: price,
           address: address,
           description: description,
+
+          # В присланной карточке дата пустая.
+          # Здесь, как и раньше, сохраняется время обработки,
+          # а не реальная дата публикации на сайте.
           published_at: Time.current,
+
           photos: photos
         }
 
@@ -64,12 +110,29 @@ module Parsers
 
     private
 
+    # Убираем лишние пробелы, включая неразрывные.
+    def normalized_text(node)
+      node&.text
+        &.gsub(/[[:space:]\u00A0\u202F]+/, ' ')
+        &.strip
+        &.presence
+    end
+
     def fetch_page(url)
       response = Faraday.get(url)
+
+      Rails.logger.info(
+        "Kufar: HTTP=#{response.status}, " \
+          "bytes=#{response.body.to_s.bytesize}"
+      )
+
+      unless response.status == 200
+        raise "Kufar: неожиданный HTTP-статус #{response.status}"
+      end
+
       Nokogiri::HTML(response.body)
     end
 
-    # общий метод сохранения объявления
     def save_ad(attributes)
       ad = Ad.find_or_initialize_by(
         site: @for_sell.present? ? 'kufar_for_sell' : 'kufar',
@@ -80,20 +143,34 @@ module Parsers
         Rails.logger.info "Найдено новое объявление: #{attributes}"
 
         ad.assign_attributes(attributes)
+
         if ad.valid?
           ad.save!
           notify_telegram(ad)
+        else
+          Rails.logger.warn(
+            "Kufar: объявление #{attributes[:external_id]} невалидно: " \
+              "#{ad.errors.full_messages.join(', ')}"
+          )
         end
       else
         Rails.logger.info "Найдено старое объявление: #{attributes}"
 
-        unless price_range(ad).include?(attributes[:price])
+        # Если у старой записи цена отсутствует,
+        # тоже обновляем её, не вызывая price_range с nil.
+        if ad.price.nil? || !price_range(ad).include?(attributes[:price])
           old_price = ad.price
 
           ad.assign_attributes(attributes)
+
           if ad.valid?
             ad.save!
-            notify_telegram(ad, old_price:)
+            notify_telegram(ad, old_price: old_price)
+          else
+            Rails.logger.warn(
+              "Kufar: объявление #{attributes[:external_id]} невалидно: " \
+                "#{ad.errors.full_messages.join(', ')}"
+            )
           end
         end
       end
@@ -104,7 +181,11 @@ module Parsers
     end
 
     def notify_telegram(ad, old_price: false)
-      Telegram::TelegramNotifier.notify_new_ad(ad, old_price:, use_for_sell_chat: @for_sell)
+      Telegram::TelegramNotifier.notify_new_ad(
+        ad,
+        old_price: old_price,
+        use_for_sell_chat: @for_sell
+      )
     end
   end
 end
